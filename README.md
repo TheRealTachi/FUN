@@ -9,7 +9,6 @@ This is a Token-2022 transfer hook. Every coin launched on fun points at it, so 
 | **Program** | [`FUNrSeDa9WjjJnAtZJpy7195jdee1VnWtEDU5nMW9Q7b`](https://solscan.io/account/FUNrSeDa9WjjJnAtZJpy7195jdee1VnWtEDU5nMW9Q7b) |
 | **Network** | Solana mainnet |
 | **Verified build** | [OtterSec status](https://verify.osec.io/status/FUNrSeDa9WjjJnAtZJpy7195jdee1VnWtEDU5nMW9Q7b) |
-| **Upgrade authority** | `5DoR7PLrCYESwMx2X7tb7fEfkw2SsZiXaJmgTj84YQ2c` |
 | **Contact** | [@launchviafun](https://x.com/launchviafun) |
 
 ## The rules
@@ -59,7 +58,5 @@ solana-verify get-program-hash FUNrSeDa9WjjJnAtZJpy7195jdee1VnWtEDU5nMW9Q7b
 ```
 
 The two hashes should match.
-
-The program is upgradeable. Its upgrade authority can change it, so a verified build only covers the version that's currently deployed.
 
 The source is in [`programs/unsniped-hook/src/lib.rs`](programs/unsniped-hook/src/lib.rs). `unsniped` is the project's original name.
