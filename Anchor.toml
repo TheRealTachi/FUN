@@ -1,0 +1,13 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+unsniped_hook = "FUNrSeDa9WjjJnAtZJpy7195jdee1VnWtEDU5nMW9Q7b"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
