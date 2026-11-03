@@ -21,6 +21,13 @@
 //!     pool exists and sealed by `initialize`; after that nobody can change it.
 //!     Listed wallets can still send or sell anything they hold.
 //!
+//!   * App rules (optional, coins launched with `initialize_with_apps`): the
+//!     launcher picks trading apps (pump.fun app, FOMO, Axiom, GMGN, Terminal)
+//!     and either blocks buys made through them or allows buys only through
+//!     them. Each app leaves a fingerprint in the transaction's top-level
+//!     instructions, read from the instructions sysvar. Coins launched with
+//!     `initialize` never pass those accounts, so the check never runs for them.
+//!
 //! Snipers are handled by the pool, not here: each coin's fee is 99% for its
 //! first few blocks, and that fee buys the coin back and burns it. The dev
 //! buy is locked in a Jupiter Lock escrow, not here, so that lock outlives
@@ -37,7 +44,11 @@
 
 use anchor_lang::{
     prelude::*,
-    solana_program::{program::invoke_signed, system_instruction},
+    solana_program::{
+        program::invoke_signed,
+        system_instruction,
+        sysvar::instructions::{self as ix_sysvar, load_instruction_at_checked},
+    },
 };
 use anchor_spl::{
     token_2022::spl_token_2022::{
@@ -59,7 +70,7 @@ solana_security_txt::security_txt! {
     contacts: "link:https://x.com/launchviafun",
     policy: "https://x.com/launchviafun",
     preferred_languages: "en",
-    source_code: "https://github.com/TheRealTachi/fun-hook"
+    source_code: "https://github.com/TheRealTachi/FUN"
 }
 
 /// Meteora DBC pool authority PDA, owner of every DBC base vault.
@@ -92,6 +103,31 @@ pub const OPEN_TRANSFERS_ARG: u32 = u32::MAX;
 /// Stored in `sells_open_at` for such a coin. Real values are 0 or a unix time,
 /// so coins launched before this option keep their rules and account layout.
 pub const TRANSFERS_OPEN: i64 = -1;
+
+pub const APPS_SEED: &[u8] = b"apps";
+/// The apps a launcher can pick, one bit each.
+pub const APP_PUMP: u8 = 1 << 0;
+pub const APP_FOMO: u8 = 1 << 1;
+pub const APP_AXIOM: u8 = 1 << 2;
+pub const APP_GMGN: u8 = 1 << 3;
+pub const APP_TERMINAL: u8 = 1 << 4;
+pub const APP_ALL: u8 = APP_PUMP | APP_FOMO | APP_AXIOM | APP_GMGN | APP_TERMINAL;
+/// Buys through the picked apps are refused; buys from anywhere else go through.
+pub const APPS_BLOCK: u8 = 0;
+/// Only buys through one of the picked apps go through.
+pub const APPS_ONLY: u8 = 1;
+/// Each app's fingerprint. The pump.fun app, Axiom, GMGN and Terminal route every
+/// trade through their own program, called as a top-level instruction. FOMO's
+/// relayer co-signs every FOMO trade, as a signer in one of its instructions.
+pub const PUMP_APP_PROGRAM: Pubkey = pubkey!("6Vo3245eszAb5wuqEMw8mGdbfRUdKbHhDHP5LcaGuTAB");
+pub const AXIOM_PROGRAM: Pubkey = pubkey!("FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9");
+pub const GMGN_PROGRAM: Pubkey = pubkey!("GMgnVFR8Jb39LoXsEVzb3DvBy3ywCmdmJquHUy1Lrkqb");
+pub const TERMINAL_PROGRAM: Pubkey = pubkey!("term9YPb9mzAsABaqN71A4xdbxHmpBNZavpBiQKZzN3");
+#[cfg(not(feature = "test-relayer"))]
+pub const FOMO_RELAYER: Pubkey = pubkey!("AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51");
+/// A key the localnet tests can sign with, standing in for FOMO's relayer.
+#[cfg(feature = "test-relayer")]
+pub const FOMO_RELAYER: Pubkey = pubkey!("GeRG9MD1BrT6hApb2DTRtZy7YpzAf4nbyFVjFZxYJueY");
 
 #[program]
 pub mod unsniped_hook {
@@ -206,6 +242,138 @@ pub mod unsniped_hook {
             max_hold: launch.max_hold,
             blocked,
         });
+        Ok(())
+    }
+
+    /// `initialize`, plus app rules: which trading apps this coin's buys may
+    /// (APPS_ONLY) or may not (APPS_BLOCK) come through, as APP_* bits. The
+    /// rules are written to the coin's apps PDA, and the extra-account-meta
+    /// list gains the instructions sysvar and that PDA, so every transfer
+    /// passes them to `execute`. Kept separate from `initialize` so coins
+    /// launched that way are untouched.
+    pub fn initialize_with_apps(
+        ctx: Context<InitializeWithApps>,
+        max_hold_bps: u16,
+        sell_lock_secs: u32,
+        apps_mode: u8,
+        apps: u8,
+    ) -> Result<()> {
+        require!((MIN_HOLD_BPS..=MAX_HOLD_BPS).contains(&max_hold_bps), HookError::BadMaxHold);
+        require!(
+            sell_lock_secs == 0 || sell_lock_secs == OPEN_TRANSFERS_ARG || (MIN_SELL_LOCK..=MAX_SELL_LOCK).contains(&sell_lock_secs),
+            HookError::BadSellLock
+        );
+        require!(apps_mode == APPS_BLOCK || apps_mode == APPS_ONLY, HookError::BadAppRules);
+        require!(apps != 0 && apps & !APP_ALL == 0, HookError::BadAppRules);
+        let supply;
+        {
+            let mint_info = ctx.accounts.mint.to_account_info();
+            let data = mint_info.try_borrow_data()?;
+            let mint = StateWithExtensions::<MintState>::unpack(&data)?;
+            let hook = mint.get_extension::<TransferHook>()?;
+            require!(
+                Option::<Pubkey>::from(hook.program_id) == Some(crate::ID),
+                HookError::WrongHookProgram
+            );
+            supply = mint.base.supply;
+        }
+
+        let mint_key = ctx.accounts.mint.key();
+
+        // index 5 = launch PDA, index 6 = blocklist PDA (as in `initialize`),
+        // index 7 = instructions sysvar, index 8 = apps PDA.
+        let metas = [
+            ExtraAccountMeta::new_with_seeds(
+                &[
+                    Seed::Literal { bytes: LAUNCH_SEED.to_vec() },
+                    Seed::AccountKey { index: 1 },
+                ],
+                false,
+                false,
+            )?,
+            ExtraAccountMeta::new_with_seeds(
+                &[
+                    Seed::Literal { bytes: BLOCKLIST_SEED.to_vec() },
+                    Seed::AccountKey { index: 1 },
+                ],
+                false,
+                false,
+            )?,
+            ExtraAccountMeta::new_with_pubkey(&ix_sysvar::ID, false, false)?,
+            ExtraAccountMeta::new_with_seeds(
+                &[
+                    Seed::Literal { bytes: APPS_SEED.to_vec() },
+                    Seed::AccountKey { index: 1 },
+                ],
+                false,
+                false,
+            )?,
+        ];
+        let metas_len = ExtraAccountMetaList::size_of(metas.len())?;
+        let lamports = Rent::get()?.minimum_balance(metas_len);
+        invoke_signed(
+            &system_instruction::create_account(
+                ctx.accounts.payer.key,
+                ctx.accounts.extra_account_meta_list.key,
+                lamports,
+                metas_len as u64,
+                &crate::ID,
+            ),
+            &[
+                ctx.accounts.payer.to_account_info(),
+                ctx.accounts.extra_account_meta_list.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[&[b"extra-account-metas", mint_key.as_ref(), &[ctx.bumps.extra_account_meta_list]]],
+        )?;
+        ExtraAccountMetaList::init::<ExecuteInstruction>(
+            &mut ctx.accounts.extra_account_meta_list.try_borrow_mut_data()?,
+            &metas,
+        )?;
+
+        let blocked = {
+            let bl = ctx.accounts.blocklist.to_account_info();
+            if bl.data_is_empty() {
+                0
+            } else {
+                require_keys_eq!(*bl.owner, crate::ID, HookError::BadBlocklist);
+                let mut d = bl.try_borrow_mut_data()?;
+                require!(d.len() >= BL_HEADER && d[..8] == BL_DISCRIMINATOR, HookError::BadBlocklist);
+                require!(d[8..40] == mint_key.to_bytes(), HookError::BadBlocklist);
+                require!(d[40..72] == ctx.accounts.payer.key().to_bytes(), HookError::NotListOwner);
+                d[72] = 1;
+                u32::from_le_bytes(d[74..78].try_into().unwrap())
+            }
+        };
+
+        let rules = &mut ctx.accounts.app_rules;
+        rules.mint = mint_key;
+        rules.mode = apps_mode;
+        rules.apps = apps;
+        rules.bump = ctx.bumps.app_rules;
+
+        let clock = Clock::get()?;
+        let launch = &mut ctx.accounts.launch;
+        launch.mint = mint_key;
+        launch.creator = ctx.accounts.payer.key();
+        launch.launch_slot = clock.slot;
+        launch.launched_at = clock.unix_timestamp;
+        launch.max_hold = (supply as u128 * max_hold_bps as u128 / 10_000) as u64;
+        launch.bump = ctx.bumps.launch;
+        launch.sells_open_at = match sell_lock_secs {
+            0 => 0,
+            OPEN_TRANSFERS_ARG => TRANSFERS_OPEN,
+            secs => clock.unix_timestamp + secs as i64,
+        };
+
+        emit!(Launched {
+            mint: mint_key,
+            creator: launch.creator,
+            launch_slot: launch.launch_slot,
+            max_hold: launch.max_hold,
+            blocked,
+        });
+        emit!(AppsSet { mint: mint_key, mode: apps_mode, apps });
         Ok(())
     }
 
@@ -350,6 +518,14 @@ pub mod unsniped_hook {
             msg!("No transfers: {} can't send this coin to {} until it bonds", from, to);
             return err!(HookError::NoTransfers);
         }
+        // App rules, on buys from the curve. Only coins launched with
+        // `initialize_with_apps` list these two accounts, and Token-2022 then
+        // always passes them; every other coin's transfers skip this.
+        if from == DBC_POOL_AUTHORITY {
+            if let [ixs, rules, ..] = ctx.remaining_accounts {
+                check_apps(ixs, rules, &launch.mint, &to)?;
+            }
+        }
         // Token-2022 calls the hook after moving the tokens, so this is the
         // destination's balance including this transfer.
         if to_balance > launch.max_hold {
@@ -392,6 +568,45 @@ fn is_blocked(info: &AccountInfo, mint: &Pubkey, wallet: &Pubkey) -> Result<bool
     Ok(false)
 }
 
+/// Refuses a buy that breaks the coin's app rules.
+fn check_apps(ixs: &AccountInfo, rules: &AccountInfo, mint: &Pubkey, buyer: &Pubkey) -> Result<()> {
+    require_keys_eq!(*ixs.key, ix_sysvar::ID, HookError::BadAppRules);
+    require_keys_eq!(*rules.owner, crate::ID, HookError::BadAppRules);
+    let r = AppRules::try_deserialize(&mut &rules.try_borrow_data()?[..])?;
+    require_keys_eq!(r.mint, *mint, HookError::BadAppRules);
+    let used = apps_used(ixs)?;
+    let allowed = if r.mode == APPS_ONLY { used & r.apps != 0 } else { used & r.apps == 0 };
+    if !allowed {
+        msg!("App rules: {} can't buy this coin through this app (mode {}, apps {:#07b}, used {:#07b})", buyer, r.mode, r.apps, used);
+        return err!(HookError::AppNotAllowed);
+    }
+    Ok(())
+}
+
+/// The APP_* bits whose fingerprints are in this transaction's top-level instructions.
+fn apps_used(ixs: &AccountInfo) -> Result<u8> {
+    let count = {
+        let d = ixs.try_borrow_data()?;
+        require!(d.len() >= 2, HookError::BadAppRules);
+        u16::from_le_bytes([d[0], d[1]]) as usize
+    };
+    let mut used = 0u8;
+    for i in 0..count {
+        let ix = load_instruction_at_checked(i, ixs)?;
+        used |= match ix.program_id {
+            PUMP_APP_PROGRAM => APP_PUMP,
+            AXIOM_PROGRAM => APP_AXIOM,
+            GMGN_PROGRAM => APP_GMGN,
+            TERMINAL_PROGRAM => APP_TERMINAL,
+            _ => 0,
+        };
+        if ix.accounts.iter().any(|a| a.pubkey == FOMO_RELAYER && a.is_signer) {
+            used |= APP_FOMO;
+        }
+    }
+    Ok(used)
+}
+
 fn owner_and_amount(info: &AccountInfo) -> Result<(Pubkey, u64)> {
     let data = info.try_borrow_data()?;
     let account = StateWithExtensions::<TokenAccountState>::unpack(&data)?;
@@ -411,6 +626,25 @@ pub struct Launch {
     /// Quick bond: unix time selling opens if the coin hasn't bonded by then (0 = never locked).
     /// TRANSFERS_OPEN = never locked, and wallet-to-wallet sends are allowed.
     pub sells_open_at: i64,
+}
+
+/// A coin's app rules, written once by `initialize_with_apps`.
+#[account]
+#[derive(InitSpace)]
+pub struct AppRules {
+    pub mint: Pubkey,
+    /// APPS_BLOCK or APPS_ONLY.
+    pub mode: u8,
+    /// APP_* bits.
+    pub apps: u8,
+    pub bump: u8,
+}
+
+#[event]
+pub struct AppsSet {
+    pub mint: Pubkey,
+    pub mode: u8,
+    pub apps: u8,
 }
 
 #[event]
@@ -442,6 +676,36 @@ pub struct Initialize<'info> {
     /// CHECK: the launcher's blocklist PDA, sealed here if it exists
     #[account(mut, seeds = [BLOCKLIST_SEED, mint.key().as_ref()], bump)]
     pub blocklist: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeWithApps<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    /// CHECK: created here
+    #[account(mut, seeds = [b"extra-account-metas", mint.key().as_ref()], bump)]
+    pub extra_account_meta_list: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Launch::INIT_SPACE,
+        seeds = [LAUNCH_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub launch: Account<'info, Launch>,
+    /// CHECK: the launcher's blocklist PDA, sealed here if it exists
+    #[account(mut, seeds = [BLOCKLIST_SEED, mint.key().as_ref()], bump)]
+    pub blocklist: UncheckedAccount<'info>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + AppRules::INIT_SPACE,
+        seeds = [APPS_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub app_rules: Account<'info, AppRules>,
     pub system_program: Program<'info, System>,
 }
 
@@ -528,4 +792,8 @@ pub enum HookError {
     TooManyBlocked,
     #[msg("The coin hasn't bonded yet, so its blocklist is still in force")]
     StillActive,
+    #[msg("App rules are not valid")]
+    BadAppRules,
+    #[msg("This coin's launcher doesn't allow buys through this app")]
+    AppNotAllowed,
 }
